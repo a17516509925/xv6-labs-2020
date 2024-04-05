@@ -6,6 +6,9 @@
 #include "proc.h"
 #include "defs.h"
 
+
+#include "fcntl.h"
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -134,6 +137,7 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  memset(&p->vma, 0, sizeof(p->vma));
   return p;
 }
 
@@ -262,6 +266,51 @@ growproc(int n)
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
+// int
+// fork(void)
+// {
+//   int i, pid;
+//   struct proc *np;
+//   struct proc *p = myproc();
+
+//   // Allocate process.
+//   if((np = allocproc()) == 0){
+//     return -1;
+//   }
+
+//   // Copy user memory from parent to child.
+//   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+//     freeproc(np);
+//     release(&np->lock);
+//     return -1;
+//   }
+//   np->sz = p->sz;
+
+//   np->parent = p;
+
+//   // copy saved user registers.
+//   *(np->trapframe) = *(p->trapframe);
+
+//   // Cause fork to return 0 in the child.
+//   np->trapframe->a0 = 0;
+
+//   // increment reference counts on open file descriptors.
+//   for(i = 0; i < NOFILE; i++)
+//     if(p->ofile[i])
+//       np->ofile[i] = filedup(p->ofile[i]);
+//   np->cwd = idup(p->cwd);
+
+//   safestrcpy(np->name, p->name, sizeof(p->name));
+
+//   pid = np->pid;
+
+//   np->state = RUNNABLE;
+
+//   release(&np->lock);
+
+//   return pid;
+// }
+
 int
 fork(void)
 {
@@ -301,11 +350,18 @@ fork(void)
   pid = np->pid;
 
   np->state = RUNNABLE;
-
+  for(int i = 0; i < VMASIZE; i++) {
+    if(p->vma[i].used){
+      memmove(&(np->vma[i]), &(p->vma[i]), sizeof(p->vma[i]));
+      filedup(p->vma[i].file);
+    }
+  }
   release(&np->lock);
-
+  
   return pid;
 }
+
+
 
 // Pass p's abandoned children to init.
 // Caller must hold p->lock.
@@ -336,6 +392,69 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
+// void
+// exit(int status)
+// {
+//   struct proc *p = myproc();
+
+//   if(p == initproc)
+//     panic("init exiting");
+
+//   // Close all open files.
+//   for(int fd = 0; fd < NOFILE; fd++){
+//     if(p->ofile[fd]){
+//       struct file *f = p->ofile[fd];
+//       fileclose(f);
+//       p->ofile[fd] = 0;
+//     }
+//   }
+
+//   begin_op();
+//   iput(p->cwd);
+//   end_op();
+//   p->cwd = 0;
+
+//   // we might re-parent a child to init. we can't be precise about
+//   // waking up init, since we can't acquire its lock once we've
+//   // acquired any other proc lock. so wake up init whether that's
+//   // necessary or not. init may miss this wakeup, but that seems
+//   // harmless.
+//   acquire(&initproc->lock);
+//   wakeup1(initproc);
+//   release(&initproc->lock);
+
+//   // grab a copy of p->parent, to ensure that we unlock the same
+//   // parent we locked. in case our parent gives us away to init while
+//   // we're waiting for the parent lock. we may then race with an
+//   // exiting parent, but the result will be a harmless spurious wakeup
+//   // to a dead or wrong process; proc structs are never re-allocated
+//   // as anything else.
+//   acquire(&p->lock);
+//   struct proc *original_parent = p->parent;
+//   release(&p->lock);
+  
+//   // we need the parent's lock in order to wake it up from wait().
+//   // the parent-then-child rule says we have to lock it first.
+//   acquire(&original_parent->lock);
+
+//   acquire(&p->lock);
+
+//   // Give any children to init.
+//   reparent(p);
+
+//   // Parent might be sleeping in wait().
+//   wakeup1(original_parent);
+
+//   p->xstate = status;
+//   p->state = ZOMBIE;
+
+//   release(&original_parent->lock);
+
+//   // Jump into the scheduler, never to return.
+//   sched();
+//   panic("zombie exit");
+// }
+
 void
 exit(int status)
 {
@@ -352,7 +471,15 @@ exit(int status)
       p->ofile[fd] = 0;
     }
   }
-
+  for(int i = 0; i < VMASIZE; i++) {
+    if(p->vma[i].used) {
+      if(p->vma[i].flags & MAP_SHARED)
+        filewrite(p->vma[i].file, p->vma[i].addr, p->vma[i].length);
+      fileclose(p->vma[i].file);
+      uvmunmap(p->pagetable, p->vma[i].addr, p->vma[i].length/PGSIZE, 1);
+      p->vma[i].used = 0;
+    }
+  }
   begin_op();
   iput(p->cwd);
   end_op();
@@ -398,6 +525,8 @@ exit(int status)
   sched();
   panic("zombie exit");
 }
+
+
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
